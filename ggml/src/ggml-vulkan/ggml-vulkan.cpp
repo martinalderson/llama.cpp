@@ -1882,6 +1882,7 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
+    size_t sync_staging_offset {};  // ring-buffer offset for batched staging writes
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -6604,6 +6605,7 @@ static bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx) {
 
     ggml_vk_submit(cpy_ctx, {});
     ctx->transfer_ctx.reset();
+    ctx->sync_staging_offset = 0;  // reset ring buffer for next batch
     return true;
 }
 
@@ -6773,6 +6775,27 @@ static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, siz
         subctx->s->buffer->buf.copyBuffer(buf->buffer, dst->buffer, slices);
         return true;
     }
+
+    // SAM/ReBAR: if destination buffer is host-visible, write directly (no staging, no fence)
+    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible && dst->ptr != nullptr) {
+        if (width == spitch) {
+            memcpy((uint8_t *)dst->ptr + offset, src, width * height);
+        } else {
+            for (size_t i = 0; i < height; i++) {
+                memcpy((uint8_t *)dst->ptr + offset + i * width, (const uint8_t *)src + i * spitch, width);
+            }
+        }
+        // barrier so GPU sees host writes before reading
+        subctx->s->buffer->buf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eHost,
+            vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
+            {},
+            {{ vk::AccessFlagBits::eHostWrite,
+               vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eTransferRead }},
+            {}, {});
+        return true;
+    }
+
     VK_LOG_DEBUG("STAGING");
 
     if (!sync_staging) {
@@ -13844,6 +13867,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 
         ggml_vk_submit(compute_ctx, {});
         ctx->submit_pending = true;
+        ctx->sync_staging_offset = 0;
     }
 
     if (ctx->submit_pending) {

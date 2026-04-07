@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <unordered_map>
 #include <vector>
 
 #ifdef __APPLE__
@@ -921,6 +922,25 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
+// GGML_EXPERT_CACHE=1: enable dedicated GPU buffer for dynamic MoE expert caching (~1 GB)
+// Keeps recently-used expert slices on GPU so consecutive tokens avoid PCIe transfers.
+static bool expert_cache_enabled = []() {
+    const char * v = getenv("GGML_EXPERT_CACHE");
+    return v && atoi(v) == 1;
+}();
+
+// dedicated GPU buffer for cached expert slices
+static ggml_backend_buffer_t expert_cache_buffer = nullptr;
+static void * expert_cache_base = nullptr;
+static size_t expert_cache_slot_sizes[2] = {}; // [0]=gate_up padded, [1]=down padded
+static size_t expert_cache_layer_stride = 0;
+
+// per-layer, per-tensor-type cache metadata: which expert ID is in each of the 8 slots
+static constexpr int CACHE_SLOTS = 8;
+static constexpr int CACHE_MAX_LAYERS = 64;
+static int expert_cache_ids[CACHE_MAX_LAYERS][2][CACHE_SLOTS]; // [layer][type][slot] = expert_id, -1 = empty
+static bool expert_cache_inited = false;
+
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
@@ -1442,6 +1462,42 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Hot experts per layer for pre-seeding the expert cache (from SWE profiling data on Gemma 4 26B-A4B)
+static constexpr int N_HOT_LAYERS = 30;
+static constexpr int N_HOT_PER_LAYER = 8;
+static constexpr int HOT_EXPERTS[N_HOT_LAYERS][N_HOT_PER_LAYER] = {
+    { 17, 124,  39,  14, 102,  53,  99,   1}, // layer  0
+    { 61,  33,   6,  18,  51,  48,  86,  70}, // layer  1
+    {  6, 111, 121,  14, 117, 125,  21,  32}, // layer  2
+    {120,   0,  64,  28,  32,  13,  78,  97}, // layer  3
+    { 23,  55, 119,  74,  27,   1, 108,  22}, // layer  4
+    { 88,  23, 127,  75,  64,   2,  67, 101}, // layer  5
+    { 73,  98,  91,  40, 113,  71,  41,  46}, // layer  6
+    {123,  48,  87,  85, 116,  63,  24,   4}, // layer  7
+    { 92,  22, 118,  89,  13,  30, 117, 125}, // layer  8
+    { 97,  65,  79, 114,  51,   9,  22,  48}, // layer  9
+    { 13,  33,  94, 115,  43,   7, 125,  11}, // layer 10
+    { 74, 120,  54, 105,  48,   3,  64,  28}, // layer 11
+    {109,  22,  40,  31, 107, 119,  23, 105}, // layer 12
+    { 60,  89,  39,  42,  86,  81, 115,  70}, // layer 13
+    { 75, 123, 120,  98, 100,  57, 103,  63}, // layer 14
+    {  8,  50,  55,  89,  96,  37,  76, 112}, // layer 15
+    { 83,  74,  27, 112,  34, 127, 117,  81}, // layer 16
+    { 49,  31,  75,  74,   1, 104, 110,  90}, // layer 17
+    {  5,  76,  99,  92, 127, 123,  95,   7}, // layer 18
+    { 97,  63,  54,  45,  43,  11,  40,  64}, // layer 19
+    { 57,  40,  35,  99,  88,  63,  10,  46}, // layer 20
+    { 74,  48,  27, 127,  87,  37,  77,  13}, // layer 21
+    { 65,  13, 103,  85, 125,  90,  35, 106}, // layer 22
+    { 46,  58, 108,  87,  77,  52,  42,  30}, // layer 23
+    { 61, 109,  66,   5,  39,  80,  96,  36}, // layer 24
+    { 33,  38, 125,  83,  77,  48,  56, 126}, // layer 25
+    { 48,   0,  42,  55,  44,  89,  54, 106}, // layer 26
+    { 70,  37,  53,   0,  38,  91,   5,   2}, // layer 27
+    {124, 118, 112,  36,  61,  93,  35,  83}, // layer 28
+    { 29,  91, 110,  30, 114,   0,   1, 121}, // layer 29
+};
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1489,6 +1545,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
+                    // lazy init: allocate GPU buffer for dynamic expert cache
+                    if (expert_cache_enabled && !expert_cache_buffer) {
+                        bool is_down = (strstr(input->name, "down") != nullptr);
+                        int type_idx = is_down ? 1 : 0;
+                        size_t padded = expert_size + std::min<size_t>(expert_size, 512);
+                        if (expert_cache_slot_sizes[type_idx] == 0) {
+                            expert_cache_slot_sizes[type_idx] = padded;
+                        }
+                        if (expert_cache_slot_sizes[0] > 0 && expert_cache_slot_sizes[1] > 0) {
+                            int n_layers = std::min((int)n_expert, CACHE_MAX_LAYERS); // n_expert is available, use actual layer count
+                            // parse actual layer count from tensor name
+                            int max_layer = 0;
+                            sscanf(input->name, "blk.%d.", &max_layer);
+                            n_layers = std::max(max_layer + 1, 30); // at least 30
+                            n_layers = std::min(n_layers, CACHE_MAX_LAYERS);
+
+                            expert_cache_layer_stride = CACHE_SLOTS * expert_cache_slot_sizes[0] + CACHE_SLOTS * expert_cache_slot_sizes[1];
+                            size_t total_size = n_layers * expert_cache_layer_stride;
+                            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
+                            expert_cache_buffer = ggml_backend_buft_alloc_buffer(buft, total_size);
+                            if (expert_cache_buffer) {
+                                expert_cache_base = ggml_backend_buffer_get_base(expert_cache_buffer);
+                                memset(expert_cache_ids, -1, sizeof(expert_cache_ids));
+                                expert_cache_inited = true;
+                                fprintf(stderr, "expert cache: allocated %.1f MB dynamic GPU buffer (%d slots/layer)\n",
+                                    (double)total_size / (1024*1024), CACHE_SLOTS);
+                            }
+                        }
+                    }
+
                     ggml_backend_synchronize(input_backend);
 
                     // get the ids
@@ -1524,7 +1610,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
-                    // group consecutive experts and copy them together
+                    // copy a contiguous range of experts [first_id, last_id] from CPU to GPU
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
@@ -1534,34 +1620,152 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                            // copy a bit extra to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
                     };
 
-                    int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
-                        id++;
-                    }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
-
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
+                    // walk a bitset and copy consecutive expert ranges
+                    auto copy_bitset_experts = [&](const ggml_bitset_t * bitset) {
+                        int id = 0;
+                        while (id < n_expert && !ggml_bitset_get(bitset, id)) {
+                            id++;
                         }
-
-                        if (id == last_id + 1) {
+                        if (id >= n_expert) {
+                            return;
+                        }
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(bitset, id)) {
+                                continue;
+                            }
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+                            copy_experts(first_id, last_id);
+                            first_id = id;
                             last_id = id;
-                            continue;
+                        }
+                        copy_experts(first_id, last_id);
+                    };
+
+                    if (!expert_cache_inited) {
+                        // no GPU cache — copy all used experts from CPU (original behaviour)
+                        copy_bitset_experts(used_ids.data());
+                    } else {
+                        // dynamic GPU cache: group cold experts for efficient CPU→GPU, batch GPU→GPU for hits + cache updates
+                        static int64_t total_hot = 0, total_cold = 0;
+                        static int64_t diag_token = 0;
+                        int layer_idx = -1;
+                        sscanf(input->name, "blk.%d.", &layer_idx);
+                        bool is_down = (strstr(input->name, "down") != nullptr);
+                        int type_idx = is_down ? 1 : 0;
+                        size_t slot_size = expert_cache_slot_sizes[type_idx];
+                        size_t type_offset = is_down ? CACHE_SLOTS * expert_cache_slot_sizes[0] : 0;
+
+                        if (layer_idx < 0 || layer_idx >= CACHE_MAX_LAYERS) {
+                            copy_bitset_experts(used_ids.data());
+                        } else {
+                            // pass 1: classify experts as hot (cached) or cold, build cold bitset
+                            std::vector<ggml_bitset_t> cold_ids(ggml_bitset_size(n_expert), 0);
+                            int hot_expert_list[CACHE_SLOTS]; // expert_ids that are cache hits
+                            int hot_slot_list[CACHE_SLOTS];   // their cache slot indices
+                            int n_hot = 0;
+                            int cold_expert_list[256]; // expert_ids that are misses (max practical)
+                            int n_cold = 0;
+
+                            for (int id = 0; id < n_expert; ++id) {
+                                if (!ggml_bitset_get(used_ids.data(), id)) continue;
+                                int slot = -1;
+                                for (int s = 0; s < CACHE_SLOTS; s++) {
+                                    if (expert_cache_ids[layer_idx][type_idx][s] == id) { slot = s; break; }
+                                }
+                                if (slot >= 0) {
+                                    hot_expert_list[n_hot] = id;
+                                    hot_slot_list[n_hot] = slot;
+                                    n_hot++;
+                                } else {
+                                    ggml_bitset_set(cold_ids.data(), id);
+                                    if (n_cold < 256) cold_expert_list[n_cold++] = id;
+                                }
+                            }
+                            total_hot += n_hot;
+                            total_cold += n_cold;
+
+                            // pass 2: copy cold experts from CPU→GPU using grouped ranges (efficient)
+                            if (n_cold > 0) {
+                                copy_bitset_experts(cold_ids.data());
+                            }
+
+                            // pass 3: GPU→GPU copies — cache hits to input_cpy, cold experts to cache
+                            auto gpu_copy_slice = [&](ggml_backend_buffer_t src_buf, size_t src_off,
+                                                      ggml_backend_buffer_t dst_buf, size_t dst_off, size_t size) {
+                                struct ggml_tensor src_s = {};
+                                src_s.type = GGML_TYPE_I8;
+                                src_s.ne[0] = size; src_s.ne[1] = 1; src_s.ne[2] = 1; src_s.ne[3] = 1;
+                                src_s.nb[0] = 1; src_s.nb[1] = size; src_s.nb[2] = size; src_s.nb[3] = size;
+                                src_s.buffer = src_buf;
+                                src_s.data = (void *)((uint8_t *)ggml_backend_buffer_get_base(src_buf) + src_off);
+
+                                struct ggml_tensor dst_s = {};
+                                dst_s.type = GGML_TYPE_I8;
+                                dst_s.ne[0] = size; dst_s.ne[1] = 1; dst_s.ne[2] = 1; dst_s.ne[3] = 1;
+                                dst_s.nb[0] = 1; dst_s.nb[1] = size; dst_s.nb[2] = size; dst_s.nb[3] = size;
+                                dst_s.buffer = dst_buf;
+                                dst_s.data = (void *)((uint8_t *)ggml_backend_buffer_get_base(dst_buf) + dst_off);
+
+                                split_backend->iface.cpy_tensor_async(split_backend, split_backend, &src_s, &dst_s);
+                            };
+
+                            // compute input_cpy buffer offset (relative to buffer base)
+                            size_t input_cpy_base_off = (uint8_t *)input_cpy->data - (uint8_t *)ggml_backend_buffer_get_base(input_cpy->buffer);
+
+                            // cache hits: GPU cache → input_cpy
+                            for (int i = 0; i < n_hot; i++) {
+                                size_t cache_off = layer_idx * expert_cache_layer_stride + type_offset + hot_slot_list[i] * slot_size;
+                                size_t dst_off = input_cpy_base_off + hot_expert_list[i] * expert_size;
+                                size_t copy_size = std::min(slot_size, (size_t)(ggml_nbytes(input) - hot_expert_list[i] * expert_size));
+                                gpu_copy_slice(expert_cache_buffer, cache_off, input_cpy->buffer, dst_off, copy_size);
+                            }
+
+                            // cache updates: input_cpy → GPU cache (for cold experts)
+                            // safe because set_tensor_async is sync for non-pinned data — data is in input_cpy
+                            int next_evict = 0;
+                            for (int i = 0; i < n_cold; i++) {
+                                int id = cold_expert_list[i];
+                                int evict_slot = -1;
+                                for (int s = 0; s < CACHE_SLOTS; s++) {
+                                    int candidate = (next_evict + s) % CACHE_SLOTS;
+                                    if (expert_cache_ids[layer_idx][type_idx][candidate] == -1) { evict_slot = candidate; break; }
+                                    bool is_hit = false;
+                                    for (int h = 0; h < n_hot; h++) {
+                                        if (expert_cache_ids[layer_idx][type_idx][candidate] == hot_expert_list[h]) { is_hit = true; break; }
+                                    }
+                                    if (!is_hit) { evict_slot = candidate; break; }
+                                }
+                                if (evict_slot < 0) evict_slot = next_evict % CACHE_SLOTS;
+                                next_evict = (evict_slot + 1) % CACHE_SLOTS;
+
+                                size_t src_off = input_cpy_base_off + id * expert_size;
+                                size_t cache_off = layer_idx * expert_cache_layer_stride + type_offset + evict_slot * slot_size;
+                                size_t copy_size = std::min(slot_size, (size_t)(ggml_nbytes(input) - id * expert_size));
+                                gpu_copy_slice(input_cpy->buffer, src_off, expert_cache_buffer, cache_off, copy_size);
+                                expert_cache_ids[layer_idx][type_idx][evict_slot] = id;
+                            }
                         }
 
-                        copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
+                        if (!is_down && layer_idx == 0) {
+                            diag_token++;
+                            if (diag_token % 100 == 0 && diag_token <= 500) {
+                                fprintf(stderr, "expert cache: token %lld: %lld hit, %lld miss, rate %.1f%%\n",
+                                    (long long)diag_token, (long long)total_hot, (long long)total_cold,
+                                    total_hot * 100.0 / std::max((int64_t)1, total_hot + total_cold));
+                                fflush(stderr);
+                            }
+                        }
                     }
-                    copy_experts(first_id, last_id);
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
