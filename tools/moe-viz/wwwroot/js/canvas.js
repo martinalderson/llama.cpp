@@ -83,6 +83,47 @@ export function renderCumulative(id, nExpert, nLayers, countsFlat, maxCount) {
     }
 }
 
+// Delta heatmap: shows deviation from baseline.
+// deltaFlat[i] = (domain_normalised[i] - baseline_normalised[i])
+// Range: -1 to +1. Blue = below baseline, grey = same, red = above baseline.
+export function renderDelta(id, nExpert, nLayers, deltaFlat, maxDelta) {
+    const c = canvases[id];
+    if (!c) return;
+    const { ctx, width, height } = c;
+
+    const cellW = width / nExpert;
+    const cellH = height / nLayers;
+
+    ctx.fillStyle = '#0e0e16';
+    ctx.fillRect(0, 0, width, height);
+
+    if (maxDelta <= 0) return;
+
+    for (let li = 0; li < nLayers; li++) {
+        for (let ei = 0; ei < nExpert; ei++) {
+            const v = deltaFlat[li * nExpert + ei];
+            if (v === 0) continue;
+
+            const raw = v / maxDelta; // -1 to +1
+            // Power curve to amplify small differences
+            const t = Math.sign(raw) * Math.pow(Math.abs(raw), 0.4);
+            let r, g, b;
+            if (t > 0) {
+                r = Math.round(30 + t * 225);
+                g = Math.round(15 + t * 50);
+                b = Math.round(15);
+            } else {
+                const s = -t;
+                r = Math.round(15);
+                g = Math.round(15 + s * 60);
+                b = Math.round(30 + s * 225);
+            }
+            ctx.fillStyle = `rgb(${r},${g},${b})`;
+            ctx.fillRect(ei * cellW, li * cellH, cellW - 0.5, cellH - 0.5);
+        }
+    }
+}
+
 export function getCellFromMouse(id, nExpert, nLayers, offsetX, offsetY) {
     const c = canvases[id];
     if (!c) return null;

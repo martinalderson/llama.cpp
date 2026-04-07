@@ -64,7 +64,7 @@
                 }
             </div>
             <canvas id="mainCanvas" @onmousemove="OnMainMouseMove" @onmouseleave="OnMouseLeave"
-                    style="flex:1;cursor:crosshair;" />
+                    style="flex:1;cursor:crosshair;height:@(_profile.NLayers * 16)px;" />
         </div>
 
         <!-- Cumulative heatmap -->
@@ -78,7 +78,7 @@
                     <div class="ylbl">@lid</div>
                 }
             </div>
-            <canvas id="cumCanvas" style="flex:1;" />
+            <canvas id="cumCanvas" style="flex:1;height:@(_profile.NLayers * 16)px;" />
         </div>
 
         <!-- Tooltip -->

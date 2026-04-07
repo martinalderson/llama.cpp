@@ -10,7 +10,12 @@
         Drop a profile JSON from <code>llama-moe-profile</code> to visualise expert routing patterns.
     </p>
 
+    <div style="display:flex; gap:16px; margin-bottom:20px;">
+        <a href="/compare" style="color:#7dd3fc; font-size:13px; position:relative; z-index:10;">Compare multiple profiles &rarr;</a>
+    </div>
+
     <div class="drop-zone @(_dragOver ? "drag-over" : "")"
+         style="position:relative;"
          @ondragover="HandleDragOver"
          @ondragover:preventDefault
          @ondragleave="() => _dragOver = false"
@@ -18,7 +23,8 @@
          @ondrop:preventDefault>
         <h2>Drop JSON here</h2>
         <p>or click to browse</p>
-        <InputFile OnChange="HandleFileSelected" accept=".json" style="opacity:0;position:absolute;inset:0;cursor:pointer;" />
+        <InputFile OnChange="HandleFileSelected" accept=".json"
+                   style="position:absolute;top:0;left:0;width:100%;height:100%;opacity:0;cursor:pointer;" />
     </div>
 
     @if (_loading)

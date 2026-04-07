@@ -1,0 +1,551 @@
+@page "/compare"
+@inject ProfileStore Store
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+@inject HttpClient Http
+@implements IAsyncDisposable
+
+<PageTitle>MoE Profile Comparison</PageTitle>
+
+<div style="margin-bottom:12px; display:flex; align-items:center; gap:16px;">
+    <h1 style="font-size:18px; font-weight:600;">Profile Comparison</h1>
+    <button @onclick="() => _showPicker = true"
+            style="font-size:12px; color:#7dd3fc; background:#1a1a24; border:1px solid #333; padding:4px 12px; border-radius:4px; cursor:pointer;">
+        Select examples
+    </button>
+    <label style="font-size:12px; color:#666; cursor:pointer; background:#1a1a24; border:1px solid #333; padding:4px 12px; border-radius:4px;">
+        + Upload
+        <InputFile OnChange="HandleFiles" accept=".json" multiple style="display:none;" />
+    </label>
+    <a href="/" style="font-size:12px; color:#555;">Back</a>
+</div>
+
+@if (_loading)
+{
+    <p style="color:#7dd3fc;">Loading @_loadProgress...</p>
+}
+
+<!-- ═══ PICKER MODAL ═══ -->
+@if (_showPicker)
+{
+    <div style="position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:200;display:flex;align-items:center;justify-content:center;"
+         @onclick="() => _showPicker = false">
+        <div style="background:#12121a;border:1px solid #333;border-radius:12px;padding:24px;max-width:800px;width:90%;"
+             @onclick:stopPropagation>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                <h2 style="font-size:16px;font-weight:600;">Select Example Profiles</h2>
+                <button @onclick="() => _showPicker = false"
+                        style="background:none;border:none;color:#666;font-size:18px;cursor:pointer;">X</button>
+            </div>
+
+            <table style="width:100%;border-collapse:collapse;font-size:12px;">
+                <thead>
+                    <tr>
+                        <th style="text-align:left;padding:6px 8px;color:#666;font-weight:500;width:140px;">Domain</th>
+                        @for (int i = 1; i <= 5; i++)
+                        {
+                            var idx = i;
+                            <th style="padding:6px 8px;color:#666;font-weight:500;">Prompt @idx</th>
+                        }
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var domain in _domains)
+                    {
+                        var d = domain;
+                        var allChecked = _domainFiles[d].All(f => _selected.Contains(f));
+                        <tr style="border-top:1px solid #1a1a24;">
+                            <td style="padding:6px 8px;">
+                                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;color:@(allChecked ? "#7dd3fc" : "#aaa");">
+                                    <input type="checkbox" checked="@allChecked"
+                                           @onchange="() => ToggleDomain(d)" />
+                                    @DomainLabel(d)
+                                </label>
+                            </td>
+                            @for (int i = 0; i < _domainFiles[d].Count; i++)
+                            {
+                                var file = _domainFiles[d][i];
+                                var prompt = _manifestPrompts.GetValueOrDefault(file, "");
+                                var isChecked = _selected.Contains(file);
+                                <td style="padding:6px 8px;text-align:center;">
+                                    <label style="cursor:pointer;" title="@prompt">
+                                        <input type="checkbox" checked="@isChecked"
+                                               @onchange="() => ToggleFile(file)" />
+                                    </label>
+                                    <div style="font-size:10px;color:#555;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+                                         title="@prompt">
+                                        @Truncate(prompt, 20)
+                                    </div>
+                                </td>
+                            }
+                        </tr>
+                    }
+                </tbody>
+            </table>
+
+            <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end;">
+                <button @onclick="SelectAll"
+                        style="font-size:12px;color:#aaa;background:#1a1a24;border:1px solid #333;padding:4px 12px;border-radius:4px;cursor:pointer;">
+                    Select all
+                </button>
+                <button @onclick="SelectNone"
+                        style="font-size:12px;color:#aaa;background:#1a1a24;border:1px solid #333;padding:4px 12px;border-radius:4px;cursor:pointer;">
+                    Clear
+                </button>
+                <button @onclick="LoadSelected"
+                        style="font-size:12px;color:#0a0a0f;background:#7dd3fc;border:none;padding:6px 20px;border-radius:4px;cursor:pointer;font-weight:600;">
+                    Load @_selected.Count profiles
+                </button>
+            </div>
+        </div>
+    </div>
+}
+
+<!-- ═══ RESULTS TABLE ═══ -->
+@if (_profiles.Count > 0)
+{
+    var groups = _profiles.GroupBy(p => GuessDomain(p.filename)).OrderBy(g => g.Key);
+
+    @foreach (var group in groups)
+    {
+        <h2 style="font-size:14px; color:#7dd3fc; margin:20px 0 8px; text-transform:uppercase; letter-spacing:1px;">@DomainLabel(group.Key)</h2>
+
+        <table style="width:100%; border-collapse:collapse; font-size:12px; margin-bottom:16px;">
+            <thead>
+                <tr style="border-bottom:1px solid #333;">
+                    <th style="text-align:left; padding:6px 8px; color:#666; font-weight:500;">Prompt</th>
+                    <th style="padding:6px 8px; color:#666; font-weight:500; width:60px;">Tokens</th>
+                    <th style="padding:6px 8px; color:#666; font-weight:500; width:70px;">Gini</th>
+                    <th style="padding:6px 8px; color:#666; font-weight:500; width:70px;">Overlap</th>
+                    <th style="padding:6px 8px; color:#666; font-weight:500; width:110px;">Unique</th>
+                    <th style="padding:6px 8px; color:#666; font-weight:500; width:50px;"></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var item in group)
+                {
+                    <tr style="border-bottom:1px solid #1a1a24; cursor:pointer;" @onclick="() => OpenDetail(item.filename)">
+                        <td style="padding:6px 8px; color:#aaa; max-width:400px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                            title="@item.stats.prompt">
+                            @Truncate(item.stats.prompt, 70)
+                        </td>
+                        <td style="padding:6px 8px; text-align:center; color:#888;">@item.stats.nGenerated</td>
+                        <td style="padding:6px 8px; text-align:center;">
+                            <span style="color:@GiniColor(item.stats.gini)">@item.stats.gini.ToString("F3")</span>
+                        </td>
+                        <td style="padding:6px 8px; text-align:center; color:#7dd3fc;">@item.stats.overlap.ToString("F1")/@item.stats.nExpertUsed</td>
+                        <td style="padding:6px 8px; text-align:center; color:#888;">@item.stats.uniqueTotal/@item.stats.totalExperts</td>
+                        <td style="padding:6px 8px;">
+                            <span style="color:#555; font-size:11px;">Detail &rarr;</span>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+
+        @(DomainSummaryHtml(group.ToList()))
+    }
+
+    <!-- Overall summary -->
+    <div style="margin:24px 0; padding:12px 16px; background:#12121a; border:1px solid #1a1a24; border-radius:8px; display:flex; gap:32px; font-size:13px;">
+        <div>
+            <span style="color:#666;">Profiles</span>
+            <span style="color:#e0e0e8; font-weight:600; margin-left:8px;">@_profiles.Count</span>
+        </div>
+        <div>
+            <span style="color:#666;">Avg Gini</span>
+            <span style="color:@GiniColor(OverallGini); font-weight:600; margin-left:8px;">@OverallGini.ToString("F3")</span>
+        </div>
+        <div>
+            <span style="color:#666;">Avg Overlap</span>
+            <span style="color:#7dd3fc; font-weight:600; margin-left:8px;">@OverallOverlap.ToString("F1")/@_profiles.First().stats.nExpertUsed</span>
+        </div>
+        <div>
+            <span style="color:#666;">Ever used</span>
+            <span style="color:#888; font-weight:600; margin-left:8px;">@OverallUniqueUsed/@_profiles.First().stats.totalExperts</span>
+        </div>
+        <div>
+            <span style="color:#666;">Never used</span>
+            <span style="color:@(OverallNeverUsed > 0 ? "#f87171" : "#4ade80"); font-weight:600; margin-left:8px;">@OverallNeverUsed</span>
+        </div>
+    </div>
+    <!-- Pairwise delta heatmaps -->
+    @if (DomainPairs.Count > 0)
+    {
+        <h2 style="font-size:14px; color:#888; margin:8px 0;">Expert Usage Delta</h2>
+        <div style="font-size:10px; color:#555; margin-bottom:8px; display:flex; gap:16px;">
+            <span><span style="color:#e44;">&#9632;</span> first domain uses more</span>
+            <span><span style="color:#48f;">&#9632;</span> second domain uses more</span>
+        </div>
+
+        @if (DomainPairs.Count > 1)
+        {
+            <div style="display:flex; gap:4px; margin-bottom:8px; flex-wrap:wrap;">
+                @foreach (var (a, b) in DomainPairs)
+                {
+                    var pair = (a, b);
+                    <button @onclick="() => _selectedPair = pair"
+                            style="font-size:11px; padding:4px 10px; border-radius:4px; cursor:pointer;
+                                   background:@(_selectedPair == pair ? "#1a2a3a" : "#1a1a24");
+                                   border:1px solid @(_selectedPair == pair ? "#7dd3fc" : "#333");
+                                   color:@(_selectedPair == pair ? "#7dd3fc" : "#888");">
+                        @DomainLabel(a) vs @DomainLabel(b)
+                    </button>
+                }
+            </div>
+        }
+
+        <canvas id="deltaCanvas" style="width:100%; border-radius:4px;" />
+    }
+}
+else if (!_loading)
+{
+    <p style="color:#555; margin-top:20px;">Click "Select examples" to pick bundled profiles, or upload your own.</p>
+}
+
+@code {
+    private record ProfileItem(string filename, ProfileStats stats, string id);
+    private record ProfileStats(double gini, double overlap, int uniqueTotal, int totalExperts,
+                                int nGenerated, int nPrefill, int nExpertUsed, string prompt);
+
+    private List<ProfileItem> _profiles = new();
+
+    private List<(string a, string b)> DomainPairs
+    {
+        get
+        {
+            var keys = _profiles.Select(p => GuessDomain(p.filename)).Distinct().OrderBy(d => d).ToList();
+            var result = new List<(string, string)>();
+            for (int i = 0; i < keys.Count; i++)
+                for (int j = i + 1; j < keys.Count; j++)
+                    result.Add((keys[i], keys[j]));
+            return result;
+        }
+    }
+
+    private double OverallGini => _profiles.Count > 0 ? _profiles.Average(i => i.stats.gini) : 0;
+    private double OverallOverlap => _profiles.Count > 0 ? _profiles.Average(i => i.stats.overlap) : 0;
+    private int OverallUniqueUsed
+    {
+        get
+        {
+            if (_profiles.Count == 0) return 0;
+            var first = _manifestData.Values.FirstOrDefault();
+            if (first == null) return 0;
+            int nLayers = first.NLayers;
+            int nExpert = first.NExpert;
+            int size = nLayers * nExpert;
+            // Union: any expert used by ANY loaded profile counts as used
+            var used = new bool[size];
+            foreach (var item in _profiles)
+            {
+                if (!_manifestData.TryGetValue(item.filename, out var m) || m.Heatmap == null) continue;
+                for (int i = 0; i < Math.Min(size, m.Heatmap.Length); i++)
+                    if (m.Heatmap[i] > 0) used[i] = true;
+            }
+            int count = 0;
+            for (int i = 0; i < size; i++) if (used[i]) count++;
+            return count;
+        }
+    }
+    private int OverallNeverUsed => _profiles.Count > 0 ? _profiles.First().stats.totalExperts - OverallUniqueUsed : 0;
+    private bool _loading;
+    private string _loadProgress = "";
+    private IJSObjectReference? _jsModule;
+    private int _nextId;
+    private bool _needsHeatmapRender;
+    private (string a, string b) _selectedPair;
+    private (string a, string b) _renderedPair;
+
+    // Picker state
+    private bool _showPicker;
+    private Dictionary<string, ManifestEntry> _manifestData = new();
+    private Dictionary<string, string> _manifestPrompts = new();
+    private List<string> _domains = new();
+    private Dictionary<string, List<string>> _domainFiles = new();
+    private HashSet<string> _selected = new();
+
+    protected override async Task OnInitializedAsync()
+    {
+        try
+        {
+            var manifest = await Http.GetFromJsonAsync<Dictionary<string, ManifestEntry>>("data/manifest.json");
+            if (manifest != null)
+            {
+                foreach (var (file, entry) in manifest)
+                {
+                    _manifestData[file] = entry;
+                    _manifestPrompts[file] = entry.Prompt;
+                    if (!_domainFiles.ContainsKey(entry.Domain))
+                        _domainFiles[entry.Domain] = new();
+                    _domainFiles[entry.Domain].Add(file);
+                }
+                _domains = _domainFiles.Keys.OrderBy(d => d).ToList();
+            }
+        }
+        catch { /* manifest not found, upload-only mode */ }
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        _jsModule ??= await JS.InvokeAsync<IJSObjectReference>("import", "./js/canvas.js");
+
+        if (_profiles.Count > 0 && (_needsHeatmapRender || _selectedPair != _renderedPair))
+        {
+            _needsHeatmapRender = false;
+            _renderedPair = _selectedPair;
+            await RenderDeltaHeatmap();
+        }
+    }
+
+    // ── Picker logic ──
+
+    private void ToggleDomain(string domain)
+    {
+        var files = _domainFiles[domain];
+        if (files.All(f => _selected.Contains(f)))
+            foreach (var f in files) _selected.Remove(f);
+        else
+            foreach (var f in files) _selected.Add(f);
+    }
+
+    private void ToggleFile(string file)
+    {
+        if (!_selected.Remove(file)) _selected.Add(file);
+    }
+
+    private void SelectAll()
+    {
+        foreach (var files in _domainFiles.Values)
+            foreach (var f in files) _selected.Add(f);
+    }
+
+    private void SelectNone() => _selected.Clear();
+
+    private Task LoadSelected()
+    {
+        _showPicker = false;
+
+        // Build from manifest — no JSON loading needed
+        _profiles.RemoveAll(p => !_selected.Contains(p.filename));
+        var existing = _profiles.Select(p => p.filename).ToHashSet();
+
+        foreach (var file in _selected.Where(f => !existing.Contains(f)))
+        {
+            if (_manifestData.TryGetValue(file, out var m))
+            {
+                var stats = new ProfileStats(m.Gini, m.Overlap, m.UniqueTotal, m.TotalExperts,
+                                             m.NGenerated, m.NPrefill, m.NExpertUsed, m.Prompt);
+                _profiles.Add(new ProfileItem(file, stats, $"p{_nextId++}"));
+            }
+        }
+
+        // Set default pair to first two domains
+        var domains = _profiles.Select(p => GuessDomain(p.filename)).Distinct().OrderBy(d => d).ToList();
+        if (domains.Count >= 2)
+            _selectedPair = (domains[0], domains[1]);
+
+        _needsHeatmapRender = true;
+        StateHasChanged();
+        return Task.CompletedTask;
+    }
+
+    // ── File upload ──
+
+    private async Task HandleFiles(InputFileChangeEventArgs e)
+    {
+        _loading = true;
+        StateHasChanged();
+
+        foreach (var file in e.GetMultipleFiles(50))
+        {
+            try
+            {
+                using var stream = file.OpenReadStream(maxAllowedSize: 100 * 1024 * 1024);
+                var profile = await JsonSerializer.DeserializeAsync<MoeProfile>(stream);
+                if (profile == null) continue;
+
+                var lastFrame = profile.NFrames - 1;
+                var gini = StatsCalculator.AvgGini(profile, lastFrame);
+                var overlap = StatsCalculator.AvgOverlap(profile, lastFrame);
+                var (total, _) = StatsCalculator.UniqueExperts(profile, lastFrame);
+                var stats = new ProfileStats(gini, overlap, total, profile.NExpert * profile.NLayers,
+                                             profile.NGenerated, profile.NPrefill, profile.NExpertUsed,
+                                             profile.Prompt.Length > 80 ? profile.Prompt[..80] : profile.Prompt);
+
+                _profiles.Add(new ProfileItem(file.Name, stats, $"p{_nextId++}"));
+            }
+            catch { }
+        }
+
+        _loading = false;
+    }
+
+
+    // ── Navigation ──
+
+    private async Task RenderDeltaHeatmap()
+    {
+        if (_jsModule == null || _profiles.Count == 0) return;
+        if (_selectedPair.a == null || _selectedPair.b == null) return;
+
+        var firstFile = _profiles.First().filename;
+        if (!_manifestData.TryGetValue(firstFile, out var meta)) return;
+        int nLayers = meta.NLayers;
+        int nExpert = meta.NExpert;
+        int size = nLayers * nExpert;
+
+        // Sum heatmaps for each domain in the pair
+        var heatA = new int[size];
+        var heatB = new int[size];
+
+        foreach (var item in _profiles)
+        {
+            var domain = GuessDomain(item.filename);
+            if (!_manifestData.TryGetValue(item.filename, out var m) || m.Heatmap == null) continue;
+
+            int[] target = null;
+            if (domain == _selectedPair.a) target = heatA;
+            else if (domain == _selectedPair.b) target = heatB;
+            if (target == null) continue;
+
+            for (int i = 0; i < Math.Min(size, m.Heatmap.Length); i++)
+                target[i] += m.Heatmap[i];
+        }
+
+        // Normalise each
+        long totalA = 0, totalB = 0;
+        for (int i = 0; i < size; i++) { totalA += heatA[i]; totalB += heatB[i]; }
+
+        // Delta: normalised A - normalised B
+        // Positive = A uses more, negative = B uses more
+        var delta = new double[size];
+        double maxDelta = 0;
+        for (int i = 0; i < size; i++)
+        {
+            double normA = totalA > 0 ? (double)heatA[i] / totalA : 0;
+            double normB = totalB > 0 ? (double)heatB[i] / totalB : 0;
+            delta[i] = normA - normB;
+            if (Math.Abs(delta[i]) > maxDelta) maxDelta = Math.Abs(delta[i]);
+        }
+
+        int canvasW = Math.Max(800, nExpert * 7);
+        int canvasH = nLayers * 8;
+
+        await _jsModule.InvokeVoidAsync("initCanvas", "deltaCanvas", canvasW, canvasH);
+        await _jsModule.InvokeVoidAsync("renderDelta", "deltaCanvas",
+            nExpert, nLayers, delta, maxDelta);
+    }
+
+    private async Task OpenDetail(string filename)
+    {
+        _loading = true;
+        _loadProgress = filename;
+        StateHasChanged();
+
+        try
+        {
+            var profile = await Http.GetFromJsonAsync<MoeProfile>($"data/{filename}");
+            if (profile != null)
+            {
+                Store.Current = profile;
+                Nav.NavigateTo("/detail");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error loading detail: {ex.Message}");
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    // ── Helpers ──
+
+    private static string GuessDomain(string filename)
+    {
+        var lower = filename.ToLowerInvariant();
+        if (lower.StartsWith("swe")) return "swe";
+        if (lower.StartsWith("excel")) return "excel";
+        if (lower.StartsWith("content")) return "content";
+        if (lower.StartsWith("history")) return "history";
+        if (lower.StartsWith("econ")) return "econ";
+        return "other";
+    }
+
+    private static string DomainLabel(string domain) => domain switch
+    {
+        "swe" => "Software Engineering",
+        "excel" => "Excel / Data",
+        "content" => "Content Writing",
+        "history" => "History",
+        "econ" => "Economics",
+        _ => domain,
+    };
+
+    private MarkupString DomainSummaryHtml(List<ProfileItem> items)
+    {
+        var used = EverUsedForProfiles(items);
+        var total = items.First().stats.totalExperts;
+        var neverUsed = total - used;
+        var avgGini = items.Average(i => i.stats.gini);
+        var avgOverlap = items.Average(i => i.stats.overlap);
+        var neu = items.First().stats.nExpertUsed;
+        var neverColor = neverUsed > 0 ? "#f87171" : "#4ade80";
+
+        return new MarkupString(
+            $"<div style=\"margin-bottom:16px;padding:8px 12px;background:#0e0e16;border:1px solid #1a1a24;border-radius:6px;display:flex;gap:24px;font-size:12px;\">"
+            + $"<div><span style=\"color:#555;\">Profiles</span> <span style=\"color:#aaa;font-weight:600;\">{items.Count}</span></div>"
+            + $"<div><span style=\"color:#555;\">Avg Gini</span> <span style=\"color:{GiniColor(avgGini)};font-weight:600;\">{avgGini:F3}</span></div>"
+            + $"<div><span style=\"color:#555;\">Avg Overlap</span> <span style=\"color:#7dd3fc;font-weight:600;\">{avgOverlap:F1}/{neu}</span></div>"
+            + $"<div><span style=\"color:#555;\">Ever used</span> <span style=\"color:#888;font-weight:600;\">{used}/{total}</span></div>"
+            + $"<div><span style=\"color:#555;\">Never used</span> <span style=\"color:{neverColor};font-weight:600;\">{neverUsed}</span></div>"
+            + "</div>");
+    }
+
+    private int EverUsedForProfiles(List<ProfileItem> items)
+    {
+        var first = _manifestData.Values.FirstOrDefault();
+        if (first == null) return 0;
+        int size = first.NLayers * first.NExpert;
+        var used = new bool[size];
+        foreach (var item in items)
+        {
+            if (!_manifestData.TryGetValue(item.filename, out var m) || m.Heatmap == null) continue;
+            for (int i = 0; i < Math.Min(size, m.Heatmap.Length); i++)
+                if (m.Heatmap[i] > 0) used[i] = true;
+        }
+        int count = 0;
+        for (int i = 0; i < size; i++) if (used[i]) count++;
+        return count;
+    }
+
+    private static string Truncate(string s, int len) =>
+        s.Length <= len ? s : s[..len] + "...";
+
+    private static string GiniColor(double gini) =>
+        gini > 0.3 ? "#f87171" : gini > 0.1 ? "#fbbf24" : "#4ade80";
+
+    private record ManifestEntry
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("domain")] public string Domain { get; init; } = "";
+        [System.Text.Json.Serialization.JsonPropertyName("prompt")] public string Prompt { get; init; } = "";
+        [System.Text.Json.Serialization.JsonPropertyName("n_generated")] public int NGenerated { get; init; }
+        [System.Text.Json.Serialization.JsonPropertyName("n_prefill")] public int NPrefill { get; init; }
+        [System.Text.Json.Serialization.JsonPropertyName("n_expert")] public int NExpert { get; init; }
+        [System.Text.Json.Serialization.JsonPropertyName("n_expert_used")] public int NExpertUsed { get; init; }
+        [System.Text.Json.Serialization.JsonPropertyName("n_layers")] public int NLayers { get; init; }
+        [System.Text.Json.Serialization.JsonPropertyName("gini")] public double Gini { get; init; }
+        [System.Text.Json.Serialization.JsonPropertyName("overlap")] public double Overlap { get; init; }
+        [System.Text.Json.Serialization.JsonPropertyName("unique_total")] public int UniqueTotal { get; init; }
+        [System.Text.Json.Serialization.JsonPropertyName("total_experts")] public int TotalExperts { get; init; }
+        [System.Text.Json.Serialization.JsonPropertyName("heatmap")] public int[]? Heatmap { get; init; }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_jsModule != null) await _jsModule.DisposeAsync();
+    }
+}

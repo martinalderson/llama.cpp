@@ -275,7 +275,8 @@ static bool run(llama_context * ctx, const common_params & params,
 static std::string json_escape(const std::string & s) {
     std::string out;
     out.reserve(s.size() + 8);
-    for (char c : s) {
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = (unsigned char)s[i];
         switch (c) {
             case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
@@ -283,8 +284,29 @@ static std::string json_escape(const std::string & s) {
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
             default:
-                if ((unsigned char)c < 0x20) out += ' ';
-                else out += c;
+                if (c < 0x20) {
+                    out += ' ';
+                } else if (c >= 0x80) {
+                    // Validate UTF-8 sequence; skip invalid bytes
+                    int len = 0;
+                    if      ((c & 0xE0) == 0xC0) len = 2;
+                    else if ((c & 0xF0) == 0xE0) len = 3;
+                    else if ((c & 0xF8) == 0xF0) len = 4;
+                    else { out += '?'; break; } // invalid lead byte
+                    if (i + len > s.size()) { out += '?'; break; }
+                    bool valid = true;
+                    for (int j = 1; j < len; ++j) {
+                        if (((unsigned char)s[i + j] & 0xC0) != 0x80) { valid = false; break; }
+                    }
+                    if (valid) {
+                        out.append(s, i, len);
+                        i += len - 1;
+                    } else {
+                        out += '?';
+                    }
+                } else {
+                    out += (char)c;
+                }
         }
     }
     return out;
