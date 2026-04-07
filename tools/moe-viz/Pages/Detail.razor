@@ -1,0 +1,315 @@
+@page "/detail"
+@inject ProfileStore Store
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+<PageTitle>MoE Detail — @(_profile?.Model ?? "")</PageTitle>
+
+@if (_profile == null)
+{
+    <p style="color:#666;">No profile loaded. <a href="/" style="color:#7dd3fc;">Go back</a></p>
+    return;
+}
+
+<div class="detail-layout">
+    <div class="detail-main">
+        <h1 style="font-size:16px; font-weight:600; margin-bottom:2px;">MoE Expert Routing</h1>
+        <div style="font-size:11px; color:#666; margin-bottom:8px;">
+            @_profile.Model &middot; @_profile.NLayers layers &times; @_profile.NExpert experts
+            &middot; top-@_profile.NExpertUsed
+            &middot; @_profile.NPrefill prefill + @_profile.NGenerated generated
+        </div>
+
+        <!-- Player -->
+        <div class="player">
+            <button @onclick="TogglePlay" class="@(_playing ? "active" : "")">@(_playing ? "Pause" : "Play")</button>
+            <button @onclick="Step">&rarr;</button>
+            <input type="range" min="0" max="@(_profile.NFrames - 1)" value="@_frame" @oninput="OnScrub" />
+            <div class="info">@(_frame + 1) / @_profile.NFrames</div>
+            <span class="phase-badge @(_currentFrame?.Gen == true ? "phase-decode" : "phase-prefill")">
+                @(_currentFrame?.Gen == true ? "decode" : "prefill")
+            </span>
+            <div class="speed-ctrl">
+                <select @bind="_speed">
+                    <option value="400">Slow</option>
+                    <option value="120">Normal</option>
+                    <option value="40">Fast</option>
+                    <option value="10">Max</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- Token bar -->
+        <div class="token-bar">
+            @{ int ctx = 25; int s = Math.Max(0, _frame - ctx); int e = Math.Min(_profile.NFrames, _frame + ctx + 1); }
+            @for (int i = s; i < e; i++)
+            {
+                var f = _profile.Frames[i];
+                var tok = StatsCalculator.EscapeToken(f.Token);
+                var isGen = f.Gen;
+                var cls = i < _frame ? (isGen ? "token-gen token-past" : "token-past")
+                        : i == _frame ? (isGen ? "token-gen token-current" : "token-current")
+                        : "token-future";
+                <span class="@cls">@tok</span>
+            }
+        </div>
+
+        <!-- Main routing canvas -->
+        <div class="grid-outer">
+            <div class="ylabels">
+                @foreach (var lid in _profile.Layers)
+                {
+                    <div class="ylbl">@lid</div>
+                }
+            </div>
+            <canvas id="mainCanvas" @onmousemove="OnMainMouseMove" @onmouseleave="OnMouseLeave"
+                    style="flex:1;cursor:crosshair;" />
+        </div>
+
+        <!-- Cumulative heatmap -->
+        <div style="font-size:11px; color:#555; margin:8px 0 4px;">
+            Cumulative Expert Usage (decode) &middot; @_decodeTokensSoFar tokens &middot; max hits: @_cumMax
+        </div>
+        <div class="grid-outer">
+            <div class="ylabels">
+                @foreach (var lid in _profile.Layers)
+                {
+                    <div class="ylbl">@lid</div>
+                }
+            </div>
+            <canvas id="cumCanvas" style="flex:1;" />
+        </div>
+
+        <!-- Tooltip -->
+        @if (_tooltipVisible)
+        {
+            <div style="position:fixed;left:@(_tooltipX+12)px;top:@(_tooltipY+12)px;background:#1e1e2a;border:1px solid #444;border-radius:6px;padding:6px 10px;font-size:11px;pointer-events:none;z-index:100;box-shadow:0 4px 16px rgba(0,0,0,0.5);">
+                @((MarkupString)_tooltipHtml)
+            </div>
+        }
+    </div>
+
+    <!-- Sidebar -->
+    <div class="detail-sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Token Predictions</div>
+            @if (_currentFrame?.Cands.Length > 0)
+            {
+                <ul class="cand-list">
+                    @for (int i = 0; i < _currentFrame.Cands.Length; i++)
+                    {
+                        var c = _currentFrame.Cands[i];
+                        var pct = (c.P * 100).ToString("F1");
+                        var tok = StatsCalculator.EscapeToken(c.T);
+                        <li class="cand-item">
+                            <span class="cand-tok">@tok</span>
+                            <div class="cand-bar-bg">
+                                <div class="cand-bar @(i == 0 ? "top" : "other")" style="width:@pct%"></div>
+                            </div>
+                            <span class="cand-pct">@pct%</span>
+                        </li>
+                    }
+                </ul>
+            }
+            else
+            {
+                <div class="no-cands">Prefill token (no predictions)</div>
+            }
+        </div>
+
+        <div style="margin-top:auto;">
+            <div class="sidebar-heading">Decode Stats</div>
+            <div class="stat-row"><span>Avg Gini</span><span class="stat-val" style="color:@GiniColor">@_gini.ToString("F3")</span></div>
+            <div class="stat-row"><span>Avg expert overlap</span><span class="stat-val">@_overlap.ToString("F1")/@_profile.NExpertUsed</span></div>
+            <div class="stat-row"><span>Unique experts</span><span class="stat-val">@_uniqueTotal/@(_profile.NExpert * _profile.NLayers)</span></div>
+            <div class="stat-row" style="margin-bottom:8px;"><span>Unique (last 64)</span><span class="stat-val">@_uniqueRecent/@(_profile.NExpert * _profile.NLayers)</span></div>
+
+            <div class="sidebar-heading">Hottest Experts (per layer)</div>
+            @if (_hottest != null)
+            {
+                @foreach (var (h, li) in _hottest.Zip(_profile.Layers))
+                {
+                    <div class="hottest-row">
+                        <span class="hottest-layer">@li</span>
+                        <span class="hottest-expert">e@(h.expertId)</span>
+                        <div class="hottest-bar" style="width:@(Math.Round(h.pct * 0.6))px"></div>
+                        <span class="hottest-pct">@(h.pct.ToString("F0"))%</span>
+                    </div>
+                }
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    private MoeProfile? _profile;
+    private IJSObjectReference? _jsModule;
+
+    private int _frame;
+    private int _speed = 120;
+    private bool _playing;
+    private System.Threading.Timer? _timer;
+    private int _cumMaxFinal;
+
+    // Stats
+    private double _gini;
+    private double _overlap;
+    private int _uniqueTotal;
+    private int _uniqueRecent;
+    private int _decodeTokensSoFar;
+    private int _cumMax;
+    private (int expertId, int count, double pct)[]? _hottest;
+
+    // Tooltip
+    private bool _tooltipVisible;
+    private double _tooltipX, _tooltipY;
+    private string _tooltipHtml = "";
+
+    private Frame? _currentFrame => _profile != null && _frame < _profile.NFrames ? _profile.Frames[_frame] : null;
+    private string GiniColor => _gini > 0.3 ? "#f87171" : _gini > 0.1 ? "#fbbf24" : "#4ade80";
+
+    protected override void OnInitialized()
+    {
+        _profile = Store.Current;
+        if (_profile != null)
+        {
+            _cumMaxFinal = StatsCalculator.CumulativeMax(_profile);
+        }
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender && _profile != null)
+        {
+            _jsModule = await JS.InvokeAsync<IJSObjectReference>("import", "./js/canvas.js");
+
+            int canvasW = Math.Max(800, _profile.NExpert * 7);
+            int canvasH = _profile.NLayers * 16;
+            await _jsModule.InvokeVoidAsync("initCanvas", "mainCanvas", canvasW, canvasH);
+            await _jsModule.InvokeVoidAsync("initCanvas", "cumCanvas", canvasW, canvasH);
+
+            await RenderCurrentFrame();
+        }
+    }
+
+    private async Task RenderCurrentFrame()
+    {
+        if (_profile == null || _jsModule == null) return;
+
+        var frame = _profile.Frames[_frame];
+
+        // Build compact frame data for JS
+        var frameObj = new {
+            sel = frame.Sel,
+            top = frame.Top,
+            neu = _profile.NExpertUsed
+        };
+        var json = JsonSerializer.Serialize(frameObj);
+        await _jsModule.InvokeVoidAsync("renderRoutingFrame", "mainCanvas",
+            _profile.NExpert, _profile.NLayers, json);
+
+        // Cumulative heatmap
+        var counts = StatsCalculator.CumulativeCounts(_profile, _frame);
+        _decodeTokensSoFar = 0;
+        for (int i = 0; i <= _frame; i++)
+            if (_profile.Frames[i].Gen) _decodeTokensSoFar++;
+
+        _cumMax = 0;
+        var flat = new int[_profile.NLayers * _profile.NExpert];
+        for (int li = 0; li < _profile.NLayers; li++)
+            for (int ei = 0; ei < _profile.NExpert; ei++)
+            {
+                var v = counts[li, ei];
+                flat[li * _profile.NExpert + ei] = v;
+                if (v > _cumMax) _cumMax = v;
+            }
+
+        await _jsModule.InvokeVoidAsync("renderCumulative", "cumCanvas",
+            _profile.NExpert, _profile.NLayers, flat, _cumMaxFinal);
+
+        // Stats
+        _gini = StatsCalculator.AvgGini(_profile, _frame);
+        _overlap = StatsCalculator.AvgOverlap(_profile, _frame);
+        var (total, recent) = StatsCalculator.UniqueExperts(_profile, _frame);
+        _uniqueTotal = total;
+        _uniqueRecent = recent;
+        _hottest = StatsCalculator.HottestPerLayer(_profile, _frame);
+
+        StateHasChanged();
+    }
+
+    private async Task TogglePlay()
+    {
+        _playing = !_playing;
+        if (_playing)
+        {
+            _timer = new System.Threading.Timer(async _ =>
+            {
+                await InvokeAsync(async () =>
+                {
+                    _frame = (_frame + 1) % _profile!.NFrames;
+                    await RenderCurrentFrame();
+                });
+            }, null, 0, _speed);
+        }
+        else
+        {
+            _timer?.Dispose();
+            _timer = null;
+        }
+    }
+
+    private async Task Step()
+    {
+        if (_playing) { _playing = false; _timer?.Dispose(); _timer = null; }
+        _frame = (_frame + 1) % _profile!.NFrames;
+        await RenderCurrentFrame();
+    }
+
+    private async Task OnScrub(ChangeEventArgs e)
+    {
+        if (_playing) { _playing = false; _timer?.Dispose(); _timer = null; }
+        if (int.TryParse(e.Value?.ToString(), out int val))
+        {
+            _frame = val;
+            await RenderCurrentFrame();
+        }
+    }
+
+    private void OnMainMouseMove(MouseEventArgs e)
+    {
+        if (_profile == null || _currentFrame == null) return;
+
+        int canvasW = Math.Max(800, _profile.NExpert * 7);
+        int canvasH = _profile.NLayers * 16;
+        double cellW = (double)canvasW / _profile.NExpert;
+        double cellH = (double)canvasH / _profile.NLayers;
+
+        int ei = (int)(e.OffsetX / cellW);
+        int li = (int)(e.OffsetY / cellH);
+
+        if (ei < 0 || ei >= _profile.NExpert || li < 0 || li >= _profile.NLayers)
+        {
+            _tooltipVisible = false;
+            return;
+        }
+
+        var sel = _currentFrame.Sel;
+        bool isActive = li < sel.Length && sel[li].Contains(ei);
+
+        _tooltipVisible = true;
+        _tooltipX = e.ClientX;
+        _tooltipY = e.ClientY;
+        _tooltipHtml = $"L<b style='color:#7dd3fc'>{_profile.Layers[li]}</b> E<b style='color:#7dd3fc'>{ei}</b> "
+            + (isActive ? "<span style='color:#4ade80'>ACTIVE</span>" : "<span style='color:#555'>idle</span>");
+    }
+
+    private void OnMouseLeave() => _tooltipVisible = false;
+
+    public async ValueTask DisposeAsync()
+    {
+        _timer?.Dispose();
+        if (_jsModule != null) await _jsModule.DisposeAsync();
+    }
+}

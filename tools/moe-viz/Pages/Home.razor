@@ -1,0 +1,91 @@
+@page "/"
+@inject ProfileStore Store
+@inject NavigationManager Nav
+
+<PageTitle>MoE Expert Routing Visualiser</PageTitle>
+
+<div style="max-width: 600px; margin: 15vh auto;">
+    <h1 style="font-size: 20px; font-weight: 600; margin-bottom: 4px;">MoE Expert Routing</h1>
+    <p style="font-size: 13px; color: #666; margin-bottom: 32px;">
+        Drop a profile JSON from <code>llama-moe-profile</code> to visualise expert routing patterns.
+    </p>
+
+    <div class="drop-zone @(_dragOver ? "drag-over" : "")"
+         @ondragover="HandleDragOver"
+         @ondragover:preventDefault
+         @ondragleave="() => _dragOver = false"
+         @ondrop="HandleDrop"
+         @ondrop:preventDefault>
+        <h2>Drop JSON here</h2>
+        <p>or click to browse</p>
+        <InputFile OnChange="HandleFileSelected" accept=".json" style="opacity:0;position:absolute;inset:0;cursor:pointer;" />
+    </div>
+
+    @if (_loading)
+    {
+        <p style="margin-top: 16px; color: #7dd3fc;">Loading...</p>
+    }
+    @if (_error != null)
+    {
+        <p style="margin-top: 16px; color: #f87171;">@_error</p>
+    }
+
+    @if (Store.Profiles.Count > 0)
+    {
+        <div style="margin-top: 32px;">
+            <h2 style="font-size: 14px; color: #888; margin-bottom: 8px;">Loaded profiles</h2>
+            @foreach (var p in Store.Profiles)
+            {
+                <div style="display:flex; justify-content:space-between; padding:8px 12px; background:#12121a; border:1px solid #1a1a24; border-radius:6px; margin-bottom:4px; cursor:pointer; font-size:13px;"
+                     @onclick="() => OpenProfile(p)">
+                    <span>@p.Model</span>
+                    <span style="color:#666;">@p.NPrefill pf + @p.NGenerated gen</span>
+                </div>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    private bool _dragOver;
+    private bool _loading;
+    private string? _error;
+
+    private void HandleDragOver() => _dragOver = true;
+
+    private async Task HandleDrop()
+    {
+        _dragOver = false;
+        // InputFile handles the actual file — this just handles the visual
+    }
+
+    private async Task HandleFileSelected(InputFileChangeEventArgs e)
+    {
+        _loading = true;
+        _error = null;
+        StateHasChanged();
+
+        try
+        {
+            using var stream = e.File.OpenReadStream(maxAllowedSize: 100 * 1024 * 1024);
+            var profile = await JsonSerializer.DeserializeAsync<MoeProfile>(stream);
+            if (profile == null) throw new Exception("Failed to parse JSON");
+            Store.Add(profile);
+            Nav.NavigateTo("/detail");
+        }
+        catch (Exception ex)
+        {
+            _error = $"Error: {ex.Message}";
+        }
+        finally
+        {
+            _loading = false;
+        }
+    }
+
+    private void OpenProfile(MoeProfile profile)
+    {
+        Store.Current = profile;
+        Nav.NavigateTo("/detail");
+    }
+}

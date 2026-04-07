@@ -1,0 +1,128 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #0a0a0f;
+    color: #e0e0e8;
+    height: 100%;
+}
+
+.app-shell {
+    padding: 12px 20px;
+    min-height: 100vh;
+}
+
+/* ── Drop zone ── */
+.drop-zone {
+    border: 2px dashed #333;
+    border-radius: 12px;
+    padding: 60px 40px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+}
+.drop-zone:hover, .drop-zone.drag-over {
+    border-color: #7dd3fc;
+    background: #0e1520;
+}
+.drop-zone h2 { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+.drop-zone p { font-size: 13px; color: #666; }
+
+/* ── Detail layout ── */
+.detail-layout {
+    display: flex;
+    gap: 20px;
+}
+.detail-main { flex: 1; min-width: 0; }
+.detail-sidebar {
+    width: 260px;
+    flex-shrink: 0;
+    position: fixed;
+    right: 20px;
+    top: 20px;
+    bottom: 20px;
+    display: flex;
+    flex-direction: column;
+}
+.detail-main { margin-right: 280px; }
+
+/* ── Player ── */
+.player { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+.player button {
+    background: #1a1a24; color: #e0e0e8; border: 1px solid #333;
+    padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;
+}
+.player button:hover { background: #2a2a3a; }
+.player button.active { background: #1a2a3a; border-color: #7dd3fc; }
+.player input[type=range] { flex: 1; min-width: 150px; accent-color: #7dd3fc; }
+.player .info { font-size: 12px; color: #888; min-width: 100px; }
+
+.speed-ctrl { font-size: 11px; color: #666; display: flex; align-items: center; gap: 4px; }
+.speed-ctrl select {
+    background: #1a1a24; color: #ccc; border: 1px solid #333;
+    padding: 2px 4px; border-radius: 3px; font-size: 11px;
+}
+
+/* ── Token bar ── */
+.token-bar {
+    font-size: 13px; padding: 8px 12px; background: #12121a; border: 1px solid #1a1a24;
+    border-radius: 6px; font-family: 'SF Mono', 'Cascadia Code', monospace;
+    height: 40px; line-height: 1.4; overflow: hidden; white-space: nowrap;
+    margin-bottom: 6px; display: flex; align-items: center;
+}
+.token-past { color: #555; }
+.token-current { color: #7dd3fc; background: #1a2a3a; padding: 1px 2px; border-radius: 2px; font-weight: 600; }
+.token-future { color: #333; }
+.token-gen { color: #4ade80; }
+.token-gen.token-current { background: #1a3a2a; color: #4ade80; }
+
+.phase-badge {
+    display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 3px;
+    margin-left: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.phase-prefill { background: #1a2a3a; color: #7dd3fc; }
+.phase-decode  { background: #1a3a2a; color: #4ade80; }
+
+/* ── Grids ── */
+.grid-outer { display: flex; gap: 0; }
+.ylabels { display: flex; flex-direction: column; gap: 1px; flex-shrink: 0; }
+.ylbl {
+    height: 16px; font-size: 9px; color: #444; display: flex; align-items: center;
+    justify-content: flex-end; padding-right: 4px; width: 24px;
+}
+
+/* ── Canvas ── */
+canvas { border-radius: 4px; display: block; }
+
+/* ── Sidebar ── */
+.sidebar-section { margin-bottom: 12px; }
+.sidebar-heading { font-size: 11px; color: #888; margin-bottom: 6px; }
+
+.cand-list { list-style: none; }
+.cand-item { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 12px; }
+.cand-bar-bg { flex: 1; height: 12px; background: #151520; border-radius: 3px; overflow: hidden; }
+.cand-bar { height: 100%; border-radius: 3px; }
+.cand-bar.top { background: #4ade80; }
+.cand-bar.other { background: #334; }
+.cand-tok {
+    min-width: 70px; font-family: monospace; color: #ccc; text-align: right;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cand-pct { min-width: 40px; text-align: right; color: #888; font-size: 11px; }
+.no-cands { color: #444; font-size: 12px; font-style: italic; }
+
+.stat-row { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 12px; color: #555; }
+.stat-val { color: #7dd3fc; font-weight: 600; }
+
+.hottest-row { display: flex; gap: 4px; align-items: center; margin-bottom: 1px; font-size: 11px; font-family: monospace; color: #aaa; }
+.hottest-layer { color: #555; width: 18px; text-align: right; }
+.hottest-expert { color: #7dd3fc; width: 28px; }
+.hottest-bar { height: 6px; background: #7dd3fc; border-radius: 2px; }
+.hottest-pct { color: #555; }
+
+/* ── Error UI ── */
+#blazor-error-ui {
+    background: #300; color: #faa; bottom: 0; display: none;
+    left: 0; padding: 0.6rem 1.25rem; position: fixed; width: 100%; z-index: 1000;
+}
+#blazor-error-ui .dismiss { cursor: pointer; position: absolute; right: 0.75rem; top: 0.5rem; }
