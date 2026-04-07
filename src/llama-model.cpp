@@ -1282,6 +1282,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
 
                 switch (hparams.n_layer) {
+                    case 30: type = LLM_TYPE_26B; break;
                     case 35: type = LLM_TYPE_E2B; break;
                     case 42: type = LLM_TYPE_E4B; break; // to confirm: E4B or E5B?
                     default: type = LLM_TYPE_UNKNOWN;
